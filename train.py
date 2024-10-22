@@ -19,7 +19,7 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123
 import os
 import time
 import math
-import pickle
+import dill
 from contextlib import nullcontext
 
 import numpy as np
@@ -27,7 +27,7 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model import GPTConfig, GPT
+from model_differential import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -71,6 +71,7 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
+print(f"using dtype: {dtype}")
 compile = True # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
@@ -104,6 +105,7 @@ print(f"tokens per iteration will be: {tokens_per_iter:,}")
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
 torch.manual_seed(1337 + seed_offset)
+torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
@@ -139,7 +141,7 @@ meta_path = os.path.join(data_dir, 'meta.pkl')
 meta_vocab_size = None
 if os.path.exists(meta_path):
     with open(meta_path, 'rb') as f:
-        meta = pickle.load(f)
+        meta = dill.load(f)
     meta_vocab_size = meta['vocab_size']
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
@@ -199,13 +201,22 @@ scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
 if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
+
+# logging
+if wandb_log and master_process:
+    import wandb
+    if init_from == 'resume':
+        wandb.init(project=wandb_project, name=wandb_run_name, config=config, id=checkpoint['wandb_id'], resume="must")
+    else:
+        wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+
 checkpoint = None # free up memory
 
 # compile the model
 if compile:
     print("compiling the model... (takes a ~minute)")
     unoptimized_model = model
-    model = torch.compile(model) # requires PyTorch 2.0
+    model = torch.compile(model, fullgraph=True) # requires PyTorch 2.0
 
 # wrap model into DDP container
 if ddp:
@@ -240,11 +251,6 @@ def get_lr(it):
     assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
     return min_lr + coeff * (learning_rate - min_lr)
-
-# logging
-if wandb_log and master_process:
-    import wandb
-    wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
@@ -282,6 +288,8 @@ while True:
                     'best_val_loss': best_val_loss,
                     'config': config,
                 }
+                if wandb_log:
+                    checkpoint['wandb_id'] = wandb.run.id
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
     if iter_num == 0 and eval_only:
